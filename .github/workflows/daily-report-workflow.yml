@@ -1,0 +1,877 @@
+name: Daily Report
+
+on:
+  schedule:
+    # Run every day at 6:50 AM EST (11:50 AM UTC)
+    # Adjust the cron schedule to your preferred time
+    - cron: "50 11 * * *"
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+      id-token: write
+
+    steps:
+      - name: Checkout team repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ORG_ACCESS_TOKEN }}
+          fetch-depth: 1
+
+      - name: Set up Git configuration
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Collect repository data
+        id: collect-data
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ACCESS_TOKEN }}
+        run: |
+          # Get yesterday's date
+          YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
+          echo "report_date=$YESTERDAY" >> $GITHUB_OUTPUT
+
+          # Get all repositories in the organization
+          # CHANGE THIS: Replace YOUR_ORG_NAME with your GitHub organization name
+          echo "Fetching repositories from YOUR_ORG_NAME organization..."
+          gh api --paginate /orgs/YOUR_ORG_NAME/repos --jq '.[] | .name' > repos.txt
+
+          echo "Found $(wc -l < repos.txt) repositories"
+          echo "Repository list:"
+          cat repos.txt
+
+          # Create a data file to store all information
+          echo "{" > data.json
+          echo '  "date": "'$YESTERDAY'",' >> data.json
+          echo '  "repositories": [' >> data.json
+
+          FIRST=true
+          while IFS= read -r repo; do
+            echo "Processing repository: $repo"
+
+            if [ "$FIRST" = true ]; then
+              FIRST=false
+            else
+              echo "," >> data.json
+            fi
+
+            echo "    {" >> data.json
+            echo '      "name": "'$repo'",' >> data.json
+
+            # Get commits from yesterday
+            echo '      "commits": ' >> data.json
+
+            # Fetch commits and store as array
+            COMMITS=$(gh api "/repos/YOUR_ORG_NAME/$repo/commits?since=${YESTERDAY}T00:00:00Z&until=${YESTERDAY}T23:59:59Z" 2>/dev/null || echo "[]")
+
+            # Validate JSON before processing
+            if echo "$COMMITS" | jq empty 2>/dev/null; then
+              # Process each commit to add stats
+              echo "$COMMITS" | jq -c '[.[] | {
+                sha: .sha[0:7],
+                full_sha: .sha,
+                author: .commit.author.name,
+                email: .commit.author.email,
+                date: .commit.author.date,
+                message: .commit.message
+              }]' > commits_basic.json
+            else
+              echo "Warning: Invalid JSON for commits in $repo, using empty array"
+              echo "[]" > commits_basic.json
+            fi
+
+            # Add stats to each commit
+            if [ "$(cat commits_basic.json)" != "[]" ]; then
+              echo "[" > commits_with_stats.json
+              FIRST_COMMIT=true
+
+              cat commits_basic.json | jq -c '.[]' | while IFS= read -r commit; do
+                FULL_SHA=$(echo "$commit" | jq -r '.full_sha')
+
+                if [ "$FIRST_COMMIT" = true ]; then
+                  FIRST_COMMIT=false
+                else
+                  echo "," >> commits_with_stats.json
+                fi
+
+                # Get detailed stats for this commit
+                STATS=$(gh api "/repos/YOUR_ORG_NAME/$repo/commits/$FULL_SHA" --jq '.stats // {additions: 0, deletions: 0, total: 0}' 2>/dev/null || echo '{"additions":0,"deletions":0,"total":0}')
+
+                # Validate stats JSON before merging
+                if echo "$STATS" | jq empty 2>/dev/null; then
+                  # Merge commit info with stats and remove full_sha
+                  echo "$commit" | jq --argjson stats "$STATS" 'del(.full_sha) | .stats = $stats' >> commits_with_stats.json
+                else
+                  # Use default stats if invalid
+                  echo "$commit" | jq 'del(.full_sha) | .stats = {additions: 0, deletions: 0, total: 0}' >> commits_with_stats.json
+                fi
+              done
+
+              echo "]" >> commits_with_stats.json
+              cat commits_with_stats.json >> data.json
+            else
+              echo "[]" >> data.json
+            fi
+
+            echo ',' >> data.json
+
+            # Get pull requests updated yesterday
+            echo '      "pull_requests": ' >> data.json
+
+            PRS=$(gh api "/repos/YOUR_ORG_NAME/$repo/pulls?state=all&sort=updated&direction=desc" 2>/dev/null || echo "[]")
+
+            # Validate JSON before processing
+            if echo "$PRS" | jq empty 2>/dev/null; then
+              echo "$PRS" | jq '[.[] | select(.updated_at | startswith("'$YESTERDAY'"))] | map({
+                number: .number,
+                title: .title,
+                author: .user.login,
+                state: .state,
+                created_at: .created_at,
+                updated_at: .updated_at,
+                merged_at: .merged_at,
+                additions: .additions,
+                deletions: .deletions,
+                changed_files: .changed_files
+              })' >> data.json
+            else
+              echo "Warning: Invalid JSON for PRs in $repo, using empty array"
+              echo "[]" >> data.json
+            fi
+            echo "    }" >> data.json
+          done < repos.txt
+
+          echo "  ]" >> data.json
+          echo "}" >> data.json
+
+          echo "Data collection complete!"
+          cat data.json
+
+      - name: Fetch code diffs for analysis
+        env:
+          GH_TOKEN: ${{ secrets.ORG_ACCESS_TOKEN }}
+          REPORT_DATE: ${{ steps.collect-data.outputs.report_date }}
+        run: |
+          echo "Fetching code diffs for each developer's commits..."
+
+          # Create a file to store diffs organized by developer
+          echo "{" > developer_diffs.json
+
+          # Read data.json and extract commits per developer
+          python3 << 'PYTHON_DIFF_SCRIPT'
+          import json
+          import subprocess
+          import os
+
+          with open('data.json', 'r') as f:
+              data = json.load(f)
+
+          developer_commits = {}
+
+          # Organize commits by developer
+          for repo in data['repositories']:
+              for commit in repo['commits']:
+                  author = commit['author']
+                  if author not in developer_commits:
+                      developer_commits[author] = []
+
+                  developer_commits[author].append({
+                      'repo': repo['name'],
+                      'sha': commit['sha'],
+                      'full_sha': commit.get('full_sha', commit['sha']),
+                      'message': commit['message']
+                  })
+
+          # Fetch diffs for each developer (limit to recent commits to avoid token limits)
+          developer_diffs = {}
+
+          for dev_name, commits in developer_commits.items():
+              print(f"Fetching diffs for {dev_name} ({len(commits)} commits)...")
+              diffs = []
+
+              # Limit to 5 most recent commits per developer to stay within token limits
+              for commit_info in commits[:5]:
+                  repo = commit_info['repo']
+                  sha = commit_info['full_sha']
+
+                  try:
+                      # Fetch the diff using gh CLI
+                      # CHANGE THIS: Replace YOUR_ORG_NAME with your organization name
+                      result = subprocess.run(
+                          ['gh', 'api', f'/repos/YOUR_ORG_NAME/{repo}/commits/{sha}'],
+                          capture_output=True,
+                          text=True,
+                          timeout=10
+                      )
+
+                      if result.returncode == 0:
+                          commit_data = json.loads(result.stdout)
+                          files_changed = commit_data.get('files', [])
+
+                          # Extract meaningful diff info
+                          for file_info in files_changed[:10]:  # Limit files per commit
+                              diffs.append({
+                                  'file': file_info.get('filename', 'unknown'),
+                                  'status': file_info.get('status', 'modified'),
+                                  'additions': file_info.get('additions', 0),
+                                  'deletions': file_info.get('deletions', 0),
+                                  'patch': file_info.get('patch', '')[:500]  # First 500 chars of diff
+                              })
+                  except Exception as e:
+                      print(f"  Error fetching diff for {repo}/{sha}: {e}")
+
+              developer_diffs[dev_name] = {
+                  'commits': commits,
+                  'diffs': diffs
+              }
+
+          # Save to JSON
+          with open('developer_diffs.json', 'w') as f:
+              json.dump(developer_diffs, f, indent=2)
+
+          print(f"\nCollected diffs for {len(developer_diffs)} developers")
+          PYTHON_DIFF_SCRIPT
+
+      - name: Upload collected data as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: daily-report-data-${{ steps.collect-data.outputs.report_date }}
+          path: |
+            data.json
+            repos.txt
+            commits_*.json
+            developer_diffs.json
+            developer_summaries.json
+          retention-days: 7
+
+      - name: Generate AI summaries using Gemini
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 << 'PYTHON_SUMMARY_SCRIPT'
+          import json
+          import subprocess
+          import os
+
+          print("🤖 Generating AI summaries using Google Gemini...")
+
+          # Check if API key is available
+          api_key = os.environ.get('GEMINI_API_KEY', '').strip()
+
+          if not api_key:
+              print("⚠️  GEMINI_API_KEY not set - skipping AI summaries")
+              print(f"Available env vars: {list(os.environ.keys())}")
+              with open('developer_summaries.json', 'w') as f:
+                  json.dump({}, f)
+              exit(0)
+
+          print(f"✓ API key found (length: {len(api_key)})")
+
+          # First, check available models
+          print("\n📋 Checking available Gemini models...")
+          try:
+              list_result = subprocess.run([
+                  'curl', '-s',
+                  'https://generativelanguage.googleapis.com/v1beta/models?key=' + api_key
+              ], capture_output=True, text=True, timeout=10)
+
+              if list_result.returncode == 0:
+                  models_response = json.loads(list_result.stdout)
+                  if 'models' in models_response:
+                      print("Available models:")
+                      for model in models_response['models'][:5]:
+                          print(f"  - {model.get('name', 'unknown')}")
+          except Exception as e:
+              print(f"Could not list models: {e}")
+
+          # Read developer diffs
+          try:
+              with open('developer_diffs.json', 'r') as f:
+                  developer_diffs = json.load(f)
+          except Exception as e:
+              print(f"Error reading developer_diffs.json: {e}")
+              with open('developer_summaries.json', 'w') as f:
+                  json.dump({}, f)
+              exit(0)
+
+          if not developer_diffs:
+              print("No developer diffs found")
+              with open('developer_summaries.json', 'w') as f:
+                  json.dump({}, f)
+              exit(0)
+
+          developer_summaries = {}
+
+          for dev_name, dev_data in developer_diffs.items():
+              diffs = dev_data.get('diffs', [])
+              commits = dev_data.get('commits', [])
+
+              if not diffs:
+                  print(f"  Skipping {dev_name} - no diffs available")
+                  continue
+
+              print(f"  Analyzing work by {dev_name} ({len(diffs)} files, {len(commits)} commits)...")
+
+              # Build context for AI
+              context = "Developer: " + dev_name + "\n"
+              context += "Commits: " + str(len(commits)) + "\n\n"
+              context += "Commit messages:\n"
+              for commit in commits[:5]:
+                  msg = commit['message'].split('\n')[0]
+                  context += "- " + msg + "\n"
+
+              context += "\nCode changes:\n"
+              for diff in diffs[:10]:
+                  context += "\nFile: " + diff['file'] + " (" + diff['status'] + ")\n"
+                  context += "Changes: +" + str(diff['additions']) + "/-" + str(diff['deletions']) + "\n"
+                  if diff.get('patch'):
+                      context += "Diff preview:\n" + diff['patch'][:300] + "\n"
+
+              # Create prompt
+              prompt = "Based on the following code changes, provide a concise 2-3 sentence summary of what this developer accomplished. Focus on the functionality they built, bugs they fixed, or improvements they made. Be specific about what changed, not just that files were modified.\n\n"
+              prompt += context
+              prompt += "\nSummary:"
+
+              try:
+                  # Call Google Gemini API
+                  url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' + api_key
+                  payload = json.dumps({
+                      'contents': [{
+                          'parts': [{
+                              'text': prompt
+                          }]
+                      }]
+                  })
+
+                  result = subprocess.run([
+                      'curl', '-s', url,
+                      '-H', 'Content-Type: application/json',
+                      '-d', payload
+                  ], capture_output=True, text=True, timeout=30)
+
+                  if result.returncode == 0:
+                      try:
+                          response = json.loads(result.stdout)
+                      except json.JSONDecodeError as e:
+                          print(f"    ✗ JSON decode error: {e}")
+                          continue
+
+                      if 'candidates' in response and len(response['candidates']) > 0:
+                          content = response['candidates'][0].get('content', {})
+                          parts = content.get('parts', [])
+                          if parts and 'text' in parts[0]:
+                              summary = parts[0]['text'].strip()
+                              developer_summaries[dev_name] = summary
+                              print(f"    ✓ Generated summary for {dev_name}")
+                          else:
+                              print(f"    ✗ No text in response for {dev_name}")
+                      elif 'error' in response:
+                          print(f"    ✗ API error: {response['error']}")
+                      else:
+                          print(f"    ✗ Unexpected response format")
+                  else:
+                      print(f"    ✗ API call failed for {dev_name}")
+
+              except Exception as e:
+                  print(f"    ✗ Error: {e}")
+
+          # Save summaries
+          with open('developer_summaries.json', 'w') as f:
+              json.dump(developer_summaries, f, indent=2)
+
+          print(f"\n✅ Generated {len(developer_summaries)} AI summaries")
+          PYTHON_SUMMARY_SCRIPT
+
+      - name: Verify summaries file
+        run: |
+          if [ -f "developer_summaries.json" ]; then
+            echo "✓ developer_summaries.json exists"
+            echo "Content preview:"
+            head -n 20 developer_summaries.json
+          else
+            echo "⚠️  developer_summaries.json not found, creating empty file"
+            echo "{}" > developer_summaries.json
+          fi
+
+      - name: Generate Markdown report
+        env:
+          REPORT_DATE: ${{ steps.collect-data.outputs.report_date }}
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import json
+          from datetime import datetime
+          import os
+
+          report_date = os.environ['REPORT_DATE']
+
+          # Read the data
+          with open('data.json', 'r') as f:
+              data = json.load(f)
+
+          # Read developer diffs (code changes)
+          developer_diffs = {}
+          try:
+              with open('developer_diffs.json', 'r') as f:
+                  developer_diffs = json.load(f)
+                  print(f"Loaded code diffs for {len(developer_diffs)} developers")
+          except Exception as e:
+              print(f"Warning: Could not load developer diffs: {e}")
+              developer_diffs = {}
+
+          # Read AI-generated summaries
+          developer_summaries = {}
+          try:
+              with open('developer_summaries.json', 'r') as f:
+                  developer_summaries = json.load(f)
+                  print(f"Loaded AI summaries for {len(developer_summaries)} developers")
+          except Exception as e:
+              print(f"Warning: Could not load developer summaries: {e}")
+              developer_summaries = {}
+
+          # Group developers by email to handle name variations
+          # Maps email -> canonical name (uses the longest/most complete name)
+          email_to_name = {}
+
+          def get_canonical_name(author_name, author_email):
+              """Get canonical name for a developer based on their email"""
+              if author_email not in email_to_name:
+                  email_to_name[author_email] = author_name
+              else:
+                  # Use the longer/more complete name
+                  existing = email_to_name[author_email]
+                  if len(author_name) > len(existing):
+                      email_to_name[author_email] = author_name
+              return email_to_name[author_email]
+
+          # Calculate statistics and track developer activity
+          total_commits = 0
+          total_prs = 0
+          total_additions = 0
+          total_deletions = 0
+          contributors = {}
+          contributors_lines = {}  # Track line changes per contributor
+          active_repos = []
+          developer_data = {}
+
+          for repo in data['repositories']:
+              repo_commits = len(repo['commits'])
+              repo_prs = len(repo['pull_requests'])
+
+              if repo_commits > 0 or repo_prs > 0:
+                  active_repos.append(repo)
+                  total_commits += repo_commits
+                  total_prs += repo_prs
+
+                  # Track commits
+                  for commit in repo['commits']:
+                      author_name = commit['author']
+                      author_email = commit.get('email', f'{author_name}@unknown')
+                      author = get_canonical_name(author_name, author_email)
+
+                      contributors[author] = contributors.get(author, 0) + 1
+
+                      # Track line changes for contributors
+                      additions = commit['stats'].get('additions', 0)
+                      deletions = commit['stats'].get('deletions', 0)
+                      total_additions += additions
+                      total_deletions += deletions
+
+                      if author not in contributors_lines:
+                          contributors_lines[author] = {'additions': 0, 'deletions': 0}
+                      contributors_lines[author]['additions'] += additions
+                      contributors_lines[author]['deletions'] += deletions
+
+                      if author not in developer_data:
+                          developer_data[author] = {
+                              'commits': [],
+                              'prs': [],
+                              'total_additions': 0,
+                              'total_deletions': 0,
+                              'repos': set()
+                          }
+
+                      developer_data[author]['commits'].append({
+                          'repo': repo['name'],
+                          'sha': commit['sha'],
+                          'message': commit['message'],
+                          'additions': additions,
+                          'deletions': deletions
+                      })
+                      developer_data[author]['total_additions'] += additions
+                      developer_data[author]['total_deletions'] += deletions
+                      developer_data[author]['repos'].add(repo['name'])
+
+                  # Track PRs (use GitHub username as-is since we don't have email)
+                  for pr in repo['pull_requests']:
+                      author = pr['author']
+                      if author not in developer_data:
+                          developer_data[author] = {
+                              'commits': [],
+                              'prs': [],
+                              'total_additions': 0,
+                              'total_deletions': 0,
+                              'repos': set()
+                          }
+
+                      developer_data[author]['prs'].append({
+                          'repo': repo['name'],
+                          'number': pr['number'],
+                          'title': pr['title'],
+                          'state': pr['state'],
+                          'merged_at': pr.get('merged_at')
+                      })
+                      developer_data[author]['repos'].add(repo['name'])
+
+          # Sort contributors
+          top_contributors = sorted(contributors.items(), key=lambda x: x[1], reverse=True)[:10]
+
+          # Count PR states
+          pr_merged = sum(1 for r in active_repos for pr in r['pull_requests'] if pr.get('merged_at'))
+          pr_open = sum(1 for r in active_repos for pr in r['pull_requests'] if not pr.get('merged_at') and pr['state'] == 'open')
+          pr_closed = total_prs - pr_merged - pr_open
+
+          # Generate Markdown report
+          # CHANGE THIS: Replace with your organization name
+          md = "# 📊 Your Organization Daily Activity Report\n\n"
+          md += f"**Date:** {data['date']}\n\n---\n\n"
+          md += "## Summary\n\n"
+          md += "| Metric | Value |\n"
+          md += "|--------|-------|\n"
+          md += f"| 🗂️ Active Repositories | {len(active_repos)} |\n"
+          md += f"| 💾 Total Commits | {total_commits} |\n"
+          md += f"| 🔀 Pull Requests | {total_prs} (✅ {pr_merged} merged, 🟢 {pr_open} open, ⚫ {pr_closed} closed) |\n"
+          md += f"| ➕ Lines Added | **+{total_additions:,}** |\n"
+          md += f"| ➖ Lines Deleted | **-{total_deletions:,}** |\n"
+          md += f"| 📈 Net Change | **{total_additions - total_deletions:+,}** |\n\n"
+          md += "### 🏆 Top Contributors\n\n"
+
+          for i, (name, count) in enumerate(top_contributors, 1):
+              lines = contributors_lines.get(name, {'additions': 0, 'deletions': 0})
+              adds = lines['additions']
+              dels = lines['deletions']
+              md += f'{i}. **{name}** - {count} commit{"s" if count != 1 else ""} '
+              md += f'(<span style="color:green">+{adds:,}</span>/<span style="color:red">-{dels:,}</span>)\n'
+
+          md += '\n---\n\n'
+
+          # Add developer summaries section
+          if developer_data:
+              md += '## 👥 Developer Activity Summaries\n\n'
+
+              # Sort developers by activity
+              sorted_devs = sorted(
+                  developer_data.items(),
+                  key=lambda x: len(x[1]['commits']) + len(x[1]['prs']),
+                  reverse=True
+              )
+
+              for dev_name, dev_data in sorted_devs:
+                  commit_count = len(dev_data['commits'])
+                  pr_count = len(dev_data['prs'])
+                  repos_worked = ', '.join(sorted(dev_data['repos']))
+
+                  md += f'### 👤 {dev_name}\n\n'
+
+                  # Stats
+                  md += f'**Stats:** {commit_count} commit{"s" if commit_count != 1 else ""} · '
+                  md += f'{pr_count} PR{"s" if pr_count != 1 else ""} · '
+                  md += f'<span style="color:green">+{dev_data["total_additions"]:,}</span> / '
+                  md += f'<span style="color:red">-{dev_data["total_deletions"]:,}</span> lines · '
+                  md += f'📁 {repos_worked}\n\n'
+
+                  # Add AI-generated summary if available
+                  if dev_name in developer_summaries:
+                      md += f'**🤖 AI Summary:**\n\n'
+                      md += f'> {developer_summaries[dev_name]}\n\n'
+
+                  # Show actual work - code changes if available
+                  md += '**Work Accomplished:**\n\n'
+
+                  # Check if we have detailed diff data for this developer
+                  if dev_name in developer_diffs and developer_diffs[dev_name].get('diffs'):
+                      diffs = developer_diffs[dev_name]['diffs']
+
+                      # Show files modified
+                      total_files = len(diffs)
+                      md += f'*Modified {total_files} file{"s" if total_files != 1 else ""}:*\n\n'
+
+                      for diff in diffs[:15]:  # Show up to 15 files
+                          file_name = diff['file']
+                          status = diff['status']
+                          adds = diff.get('additions', 0)
+                          dels = diff.get('deletions', 0)
+
+                          # Status emoji
+                          status_emoji = {
+                              'added': '🆕',
+                              'modified': '✏️',
+                              'removed': '🗑️',
+                              'renamed': '📝'
+                          }.get(status, '📄')
+
+                          md += f'- {status_emoji} `{file_name}` '
+                          if adds > 0 or dels > 0:
+                              md += f'(<span style="color:green">+{adds}</span>/<span style="color:red">-{dels}</span>)'
+                          md += '\n'
+
+                      if total_files > 15:
+                          md += f'- *...and {total_files - 15} more files*\n'
+
+                      md += '\n**Commits:**\n\n'
+
+                      # Show commit list with less detail since we have file info above
+                      for commit_info in dev_data['commits'][:5]:  # Show fewer commits
+                          repo_name = commit_info['repo']
+                          sha = commit_info['sha']
+                          msg = commit_info['message'].split('\n')[0][:80]
+                          # CHANGE THIS: Replace YOUR_ORG_NAME with your organization name
+                          md += f'- [{repo_name}] {msg} ([`{sha}`](https://github.com/YOUR_ORG_NAME/{repo_name}/commit/{sha}))\n'
+
+                      if len(dev_data['commits']) > 5:
+                          md += f'- *...and {len(dev_data["commits"]) - 5} more commits*\n'
+                  else:
+                      # Fallback to commit list if no diff data available
+                      for commit_info in dev_data['commits'][:10]:
+                          repo_name = commit_info['repo']
+                          sha = commit_info['sha']
+                          msg = commit_info['message'].split('\n')[0][:100]
+                          adds = commit_info.get('additions', 0)
+                          dels = commit_info.get('deletions', 0)
+                          # CHANGE THIS: Replace YOUR_ORG_NAME with your organization name
+                          md += f'- **[{repo_name}]** {msg} '
+                          md += f'([`{sha}`](https://github.com/YOUR_ORG_NAME/{repo_name}/commit/{sha})) '
+                          md += f'+{adds}/-{dels}\n'
+
+                      if len(dev_data['commits']) > 10:
+                          md += f'- *...and {len(dev_data["commits"]) - 10} more commits*\n'
+
+                  md += '\n'
+
+          md += '---\n\n'
+
+          # Add repository details
+          md += '## 📁 Repository Details\n\n'
+
+          for repo in active_repos:
+              repo_name = repo['name']
+              # CHANGE THIS: Replace YOUR_ORG_NAME with your organization name
+              md += f'### [{repo_name}](https://github.com/YOUR_ORG_NAME/{repo_name})\n\n'
+
+              # Commits
+              if repo['commits']:
+                  md += f'#### Commits ({len(repo["commits"])})\n\n'
+                  md += '| SHA | Author | Message | Changes |\n'
+                  md += '|-----|--------|---------|----------|\n'
+
+                  for commit in repo['commits']:
+                      sha = commit['sha']
+                      author = commit['author']
+                      message = commit['message'].split('\n')[0][:80].replace('|', '\\|')
+                      stats = commit['stats']
+                      additions = stats.get('additions', 0)
+                      deletions = stats.get('deletions', 0)
+
+                      # CHANGE THIS: Replace YOUR_ORG_NAME with your organization name
+                      md += f'| [`{sha}`](https://github.com/YOUR_ORG_NAME/{repo_name}/commit/{sha}) | {author} | {message} | '
+                      md += f'<span style="color:green">+{additions}</span> / <span style="color:red">-{deletions}</span> |\n'
+
+                  md += '\n'
+
+              # Pull Requests
+              if repo['pull_requests']:
+                  md += f'#### Pull Requests ({len(repo["pull_requests"])})\n\n'
+                  md += '| PR | Title | Author | State | Changes |\n'
+                  md += '|----|-------|--------|-------|----------|\n'
+
+                  for pr in repo['pull_requests']:
+                      number = pr['number']
+                      title = pr['title'].replace('|', '\\|')
+                      author = pr['author']
+                      state = pr['state']
+                      merged_at = pr.get('merged_at')
+                      additions = pr.get('additions') or 'N/A'
+                      deletions = pr.get('deletions') or 'N/A'
+
+                      # Determine state display
+                      if merged_at:
+                          state_badge = '🟣 Merged'
+                      elif state == 'open':
+                          state_badge = '🟢 Open'
+                      else:
+                          state_badge = '⚫ Closed'
+
+                      changes = f'<span style="color:green">+{additions}</span> / <span style="color:red">-{deletions}</span>' if additions != 'N/A' else 'N/A'
+
+                      # CHANGE THIS: Replace YOUR_ORG_NAME with your organization name
+                      md += f'| [#{number}](https://github.com/YOUR_ORG_NAME/{repo_name}/pull/{number}) | {title} | {author} | {state_badge} | {changes} |\n'
+
+                  md += '\n'
+
+          # Footer
+          now = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+          md += "---\n\n"
+          md += "<div align=\"center\">\n\n"
+          md += f"*Generated on {now}*\n\n"
+          # CHANGE THIS: Replace with your organization name or remove
+          md += "🤖 **Powered by GitHub Actions + Google Gemini**\n\n"
+          md += "</div>\n"
+
+          # Write the Markdown file in year/month/day.md structure
+          year, month, day = report_date.split('-')
+          report_dir = f'reports/{year}/{month}'
+          report_path = f'{report_dir}/{day}.md'
+
+          # Create directory structure if it doesn't exist
+          os.makedirs(report_dir, exist_ok=True)
+          print(f"Created directory: {report_dir}")
+
+          with open(report_path, 'w') as f:
+              f.write(md)
+
+          print(f"✅ Markdown report generated successfully")
+          print(f"   Active repositories: {len(active_repos)}")
+          print(f"   Total commits: {total_commits}")
+          print(f"   Total PRs: {total_prs} (Merged: {pr_merged}, Open: {pr_open}, Closed: {pr_closed})")
+          print(f"   Lines changed: +{total_additions:,} / -{total_deletions:,}")
+          PYTHON_SCRIPT
+
+      - name: Verify report was generated
+        env:
+          REPORT_DATE: ${{ steps.collect-data.outputs.report_date }}
+        run: |
+          # Extract year, month, day
+          YEAR=$(echo $REPORT_DATE | cut -d'-' -f1)
+          MONTH=$(echo $REPORT_DATE | cut -d'-' -f2)
+          DAY=$(echo $REPORT_DATE | cut -d'-' -f3)
+
+          REPORT_FILE="reports/${YEAR}/${MONTH}/${DAY}.md"
+
+          if [ -f "$REPORT_FILE" ]; then
+            echo "✓ Report generated successfully: $REPORT_FILE"
+            echo "File size: $(du -h "$REPORT_FILE" | cut -f1)"
+            ls -lh "$REPORT_FILE"
+          else
+            echo "✗ Error: Report file not found at $REPORT_FILE"
+            echo "Contents of reports directory:"
+            find reports/ -type f || echo "No reports found"
+            echo ""
+            echo "Contents of current directory:"
+            ls -la
+            exit 1
+          fi
+
+      - name: Re-configure Git credentials
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.ORG_ACCESS_TOKEN }}@github.com/${{ github.repository }}.git
+
+      - name: Commit and push report
+        env:
+          REPORT_DATE: ${{ steps.collect-data.outputs.report_date }}
+        run: |
+          # Extract year, month, day
+          YEAR=$(echo $REPORT_DATE | cut -d'-' -f1)
+          MONTH=$(echo $REPORT_DATE | cut -d'-' -f2)
+          DAY=$(echo $REPORT_DATE | cut -d'-' -f3)
+
+          # Add the generated report
+          git add reports/${YEAR}/${MONTH}/${DAY}.md
+
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Daily report for ${REPORT_DATE}"
+            git push origin main
+            echo "Report committed and pushed successfully"
+          fi
+
+      - name: Prepare email variables
+        id: email-vars
+        env:
+          REPORT_DATE: ${{ steps.collect-data.outputs.report_date }}
+        run: |
+          YEAR=$(echo $REPORT_DATE | cut -d'-' -f1)
+          MONTH=$(echo $REPORT_DATE | cut -d'-' -f2)
+          DAY=$(echo $REPORT_DATE | cut -d'-' -f3)
+          echo "year=$YEAR" >> $GITHUB_OUTPUT
+          echo "month=$MONTH" >> $GITHUB_OUTPUT
+          echo "day=$DAY" >> $GITHUB_OUTPUT
+
+      - name: Send email notification
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "📊 Daily Report - ${{ steps.collect-data.outputs.report_date }}"
+          # CHANGE THIS: Replace with your email addresses
+          to: your-team@example.com
+          from: Daily Reports Bot
+          body: |
+            Daily activity report for ${{ steps.collect-data.outputs.report_date }} has been generated!
+
+            📊 View the report here:
+            https://github.com/${{ github.repository }}/blob/main/reports/${{ steps.email-vars.outputs.year }}/${{ steps.email-vars.outputs.month }}/${{ steps.email-vars.outputs.day }}.md
+
+            This report includes:
+            - Activity across all organization repositories
+            - Top 10 contributors with line change statistics
+            - AI-generated summaries of developer work
+            - Detailed commit and PR information
+
+            ---
+            Generated automatically by GitHub Actions
+
+      - name: Upload Markdown report as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: daily-report-md-${{ steps.collect-data.outputs.report_date }}
+          path: reports/**/*.md
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Create summary
+        if: always()
+        env:
+          REPORT_DATE: ${{ steps.collect-data.outputs.report_date }}
+        run: |
+          # Extract year, month, day
+          YEAR=$(echo $REPORT_DATE | cut -d'-' -f1)
+          MONTH=$(echo $REPORT_DATE | cut -d'-' -f2)
+          DAY=$(echo $REPORT_DATE | cut -d'-' -f3)
+
+          REPORT_PATH="reports/${YEAR}/${MONTH}/${DAY}.md"
+
+          echo "## Daily Report Generated 📊" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** ${REPORT_DATE}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f "$REPORT_PATH" ]; then
+            echo "✅ Report generated successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "View the report: [${REPORT_PATH}](../blob/main/${REPORT_PATH})" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📧 Email notification sent" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Report generation failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Check the artifacts below for collected data" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- **daily-report-data-${REPORT_DATE}**: Collected repository data (data.json)" >> $GITHUB_STEP_SUMMARY
+          echo "- **daily-report-md-${REPORT_DATE}**: Generated Markdown report (if successful)" >> $GITHUB_STEP_SUMMARY
