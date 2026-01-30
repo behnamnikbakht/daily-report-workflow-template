@@ -40,14 +40,7 @@ Automatically generate comprehensive daily activity reports for your GitHub orga
 
 ## 🚀 Quick Start
 
-### 1. Copy the Workflow
-
-```bash
-mkdir -p .github/workflows
-cp daily-report-workflow-template.yml .github/workflows/daily-report.yml
-```
-
-### 2. Customize
+### 1. Customize the Workflow
 
 Open `.github/workflows/daily-report.yml` and replace:
 - `YOUR_ORG_NAME` - Your GitHub organization name
@@ -55,7 +48,7 @@ Open `.github/workflows/daily-report.yml` and replace:
 
 **See [TEMPLATE_SETUP.md](TEMPLATE_SETUP.md) for detailed instructions.**
 
-### 3. Add Secrets
+### 2. Add Secrets
 
 Go to **Settings → Secrets and variables → Actions** and add:
 
@@ -66,7 +59,7 @@ Go to **Settings → Secrets and variables → Actions** and add:
 | `EMAIL_USERNAME` | Gmail address | Your Gmail |
 | `EMAIL_PASSWORD` | Gmail App Password | [Google Account](https://myaccount.google.com/apppasswords) |
 
-### 4. Run It
+### 3. Run It
 
 - **Manual:** Actions → Daily Report → Run workflow
 - **Automatic:** Runs daily at 6:50 AM EST
