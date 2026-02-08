@@ -4,7 +4,8 @@ on:
   schedule:
     # Run every day at 6:50 AM EST (11:50 AM UTC)
     # Adjust the cron schedule to your preferred time
-    - cron: "50 11 * * *"
+    - cron: "50 11 1 1 *"
+    #- cron: "50 11 * * *"
   workflow_dispatch: # Allow manual trigger
 
 jobs:
